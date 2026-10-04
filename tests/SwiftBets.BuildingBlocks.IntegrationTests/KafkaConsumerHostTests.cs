@@ -53,6 +53,32 @@ public sealed class KafkaConsumerHostTests(RedpandaFixture redpanda)
         harness.Handled.ShouldBeEmpty();
     }
 
+    [Fact]
+    public async Task In_flight_mode_lets_other_keys_pass_a_slow_message_and_keeps_each_key_in_order()
+    {
+        await using var harness = await Harness.StartAsync(redpanda, failuresBeforeSuccess: 0, maxInFlight: 8);
+
+        await harness.PublishAsync("slow-1", "k1");
+        await harness.PublishAsync("fast", "k2");
+        await harness.PublishAsync("after-slow", "k1");
+
+        await harness.WaitForHandledAsync(3);
+        harness.Handled.ShouldBe(["fast", "slow-1", "after-slow"]);
+    }
+
+    [Fact]
+    public async Task In_flight_mode_redelivers_a_failed_message_and_holds_its_key_behind_it()
+    {
+        await using var harness = await Harness.StartAsync(redpanda, failuresBeforeSuccess: 1, maxInFlight: 8);
+
+        await harness.PublishAsync("flaky", "k1");
+        await harness.PublishAsync("follower", "k1");
+
+        await harness.WaitForHandledAsync(2);
+        harness.Handled.ShouldBe(["flaky", "follower"]);
+        harness.DeadLetterIsEmpty().ShouldBeTrue();
+    }
+
     private sealed class Harness : IAsyncDisposable
     {
         private readonly IHost _host;
@@ -76,7 +102,7 @@ public sealed class KafkaConsumerHostTests(RedpandaFixture redpanda)
 
         public bool IsRunning => !_host.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.IsCancellationRequested;
 
-        public static async Task<Harness> StartAsync(RedpandaFixture redpanda, int failuresBeforeSuccess, bool failDeadLetters = false)
+        public static async Task<Harness> StartAsync(RedpandaFixture redpanda, int failuresBeforeSuccess, bool failDeadLetters = false, int maxInFlight = 1)
         {
             var environment = Kafka.UniqueEnvironment();
             var topic = TopicName.For(TopicBase, environment);
@@ -93,15 +119,15 @@ public sealed class KafkaConsumerHostTests(RedpandaFixture redpanda)
                     services.AddSingleton(TimeProvider.System);
                     services.AddSingleton<IEventPublisher>(failDeadLetters ? new DeadLetterRefusingPublisher(publisher) : publisher);
                     services.AddSingleton(options);
-                    services.AddKafkaConsumer<TestEvent, RecordingHandler>(TopicBase, "group-" + environment);
+                    services.AddKafkaConsumer<TestEvent, RecordingHandler>(TopicBase, "group-" + environment, maxInFlight: maxInFlight);
                 })
                 .Build();
             await host.StartAsync();
             return new Harness(host, publisher, state, topic.Value, redpanda.BootstrapServers);
         }
 
-        public Task PublishAsync(string name) =>
-            _publisher.PublishAsync(TopicBase, "k", EventEnvelope<TestEvent>.Create(new TestEvent(name, 1), DateTimeOffset.UtcNow, "corr"), CancellationToken.None);
+        public Task PublishAsync(string name, string key = "k") =>
+            _publisher.PublishAsync(TopicBase, key, EventEnvelope<TestEvent>.Create(new TestEvent(name, 1), DateTimeOffset.UtcNow, "corr"), CancellationToken.None);
 
         public Task PublishRawAsync(byte[] value) =>
             _publisher.PublishRawAsync(new OutgoingMessage(_topic, "k", value, new Dictionary<string, string>()), CancellationToken.None);
@@ -160,15 +186,19 @@ public sealed class KafkaConsumerHostTests(RedpandaFixture redpanda)
 
     private sealed class RecordingHandler(RecordingHandler.State state) : IEventHandler<TestEvent>
     {
-        public Task HandleAsync(ConsumedEvent<TestEvent> message, CancellationToken cancellationToken)
+        public async Task HandleAsync(ConsumedEvent<TestEvent> message, CancellationToken cancellationToken)
         {
             if (Interlocked.Increment(ref state.AttemptCounter) <= state.FailuresBeforeSuccess)
             {
                 throw new TimeoutException("database briefly unavailable");
             }
 
+            if (message.Envelope.Payload.Name.StartsWith("slow", StringComparison.Ordinal))
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+            }
+
             state.Handled.Enqueue(message.Envelope.Payload.Name);
-            return Task.CompletedTask;
         }
 
         public sealed class State

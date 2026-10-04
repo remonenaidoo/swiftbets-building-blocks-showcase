@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -15,7 +16,8 @@ namespace SwiftBets.BuildingBlocks.Messaging;
 
 /// <summary>
 /// Consumes one topic: validates, hands the event to its handler in a DI scope, and commits the offset only after
-/// success or after the message has been parked on the topic's dead-letter queue.
+/// success or after the message has been parked on the topic's dead-letter queue. With <see cref="ConsumerRegistration.MaxInFlight"/>
+/// above 1 it handles messages with different keys concurrently, each key still in order.
 /// </summary>
 public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
     where TPayload : IEventContract
@@ -29,7 +31,12 @@ public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
     private readonly Dictionary<TopicPartition, DateTimeOffset> _pausedUntil = [];
-    private readonly Dictionary<TopicPartitionOffset, int> _transientAttempts = [];
+    private readonly ConcurrentDictionary<TopicPartitionOffset, int> _transientAttempts = new();
+
+    // Concurrent mode: each partition's dispatched messages by offset, and the last message dispatched per key.
+    private readonly Dictionary<TopicPartition, SortedList<long, Task<DateTimeOffset?>>> _inFlight = [];
+    private readonly Dictionary<string, Task<DateTimeOffset?>> _lastByKey = new(StringComparer.Ordinal);
+    private int _inFlightCount;
 
     public KafkaConsumerHost(
         ConsumerRegistration registration,
@@ -67,16 +74,23 @@ public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
         };
 
         using var consumer = new ConsumerBuilder<string, byte[]>(config)
-            .SetPartitionsRevokedHandler((_, revoked) =>
+            .SetPartitionsRevokedHandler((c, revoked) =>
             {
                 foreach (var partition in revoked)
                 {
                     _pausedUntil.Remove(partition.TopicPartition);
+                    DrainOnRevoke(c, partition.TopicPartition);
                 }
             })
             .Build();
         consumer.Subscribe(Topic.Value);
         LogStarted(Topic.Value, _registration.GroupId);
+
+        if (_registration.MaxInFlight > 1)
+        {
+            await RunConcurrentAsync(consumer, stoppingToken).ConfigureAwait(false);
+            return;
+        }
 
         try
         {
@@ -121,6 +135,181 @@ public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
         }
     }
 
+    private async Task RunConcurrentAsync(IConsumer<string, byte[]> consumer, CancellationToken stoppingToken)
+    {
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                ResumeDuePartitions(consumer);
+                if (_inFlightCount >= _registration.MaxInFlight)
+                {
+                    await Task.WhenAny(_inFlight.Values.SelectMany(l => l.Values)).ConfigureAwait(false);
+                    await SweepAsync(consumer).ConfigureAwait(false);
+                    continue;
+                }
+
+                ConsumeResult<string, byte[]>? result;
+                try
+                {
+                    // Short polls while work is in flight, so finished offsets are committed promptly.
+                    result = consumer.Consume(TimeSpan.FromMilliseconds(_inFlightCount > 0 ? 5 : 250));
+                }
+                catch (ConsumeException ex) when (!ex.Error.IsFatal)
+                {
+                    LogConsumeError(ex, Topic.Value);
+                    continue;
+                }
+
+                if (result is not null && !result.IsPartitionEOF)
+                {
+                    Dispatch(result, stoppingToken);
+                }
+
+                await SweepAsync(consumer).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            var pending = _inFlight.Values.SelectMany(l => l.Values).ToArray();
+            try
+            {
+                await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+            {
+            }
+
+            await SweepAsync(consumer).ConfigureAwait(false);
+            consumer.Close();
+        }
+    }
+
+    private void Dispatch(ConsumeResult<string, byte[]> result, CancellationToken stoppingToken)
+    {
+        var key = result.Message.Key ?? string.Empty;
+        _lastByKey.TryGetValue(key, out var previous);
+        var task = AfterAsync(previous, result, stoppingToken);
+        _lastByKey[key] = task;
+        if (!_inFlight.TryGetValue(result.TopicPartition, out var list))
+        {
+            _inFlight[result.TopicPartition] = list = [];
+        }
+
+        list[result.Offset.Value] = task;
+        _inFlightCount++;
+    }
+
+    /// <summary>A key's next message waits for the one before it; if that one must be redelivered, so must this one.</summary>
+    private async Task<DateTimeOffset?> AfterAsync(Task<DateTimeOffset?>? previous, ConsumeResult<string, byte[]> result, CancellationToken stoppingToken)
+    {
+        if (previous is not null && await previous.ConfigureAwait(false) is { } held)
+        {
+            return held;
+        }
+
+        return await ProcessSafelyAsync(result, stoppingToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Commits each partition past its contiguous run of handled messages. The first one that must be redelivered pauses
+    /// the partition and rewinds it there, once everything after it has finished; those are redelivered too.
+    /// </summary>
+    private async Task SweepAsync(IConsumer<string, byte[]> consumer)
+    {
+        var commits = new List<TopicPartitionOffset>();
+        foreach (var (partition, list) in _inFlight)
+        {
+            long? next = null;
+            while (list.Count > 0 && list.Values[0].IsCompletedSuccessfully)
+            {
+                var offset = list.Keys[0];
+                if (list.Values[0].Result is { } until)
+                {
+                    try
+                    {
+                        await Task.WhenAll(list.Values).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+
+                    consumer.Pause([partition]);
+                    consumer.Seek(new TopicPartitionOffset(partition, offset));
+                    _pausedUntil[partition] = until;
+                    Forget(list.Values);
+                    _inFlightCount -= list.Count;
+                    list.Clear();
+                    break;
+                }
+
+                Forget([list.Values[0]]);
+                list.RemoveAt(0);
+                _inFlightCount--;
+                next = offset + 1;
+            }
+
+            if (next is { } committed)
+            {
+                commits.Add(new TopicPartitionOffset(partition, committed));
+            }
+        }
+
+        if (commits.Count > 0)
+        {
+            consumer.Commit(commits);
+        }
+    }
+
+    private void DrainOnRevoke(IConsumer<string, byte[]> consumer, TopicPartition partition)
+    {
+        if (!_inFlight.Remove(partition, out var list))
+        {
+            return;
+        }
+
+        try
+        {
+            Task.WaitAll([.. list.Values], TimeSpan.FromSeconds(30));
+        }
+        catch (AggregateException)
+        {
+        }
+
+        long? next = null;
+        foreach (var (offset, task) in list)
+        {
+            if (!task.IsCompletedSuccessfully || task.Result is not null)
+            {
+                break;
+            }
+
+            next = offset + 1;
+        }
+
+        if (next is { } committed)
+        {
+            consumer.Commit([new TopicPartitionOffset(partition, committed)]);
+        }
+
+        Forget(list.Values);
+        _inFlightCount -= list.Count;
+    }
+
+    private void Forget(IEnumerable<Task<DateTimeOffset?>> tasks)
+    {
+        foreach (var task in tasks)
+        {
+            foreach (var key in _lastByKey.Where(k => k.Value == task).Select(k => k.Key).ToList())
+            {
+                _lastByKey.Remove(key);
+            }
+        }
+    }
+
     /// <summary>
     /// No single message may stop the consumer: anything that escapes processing, including a dead-letter publish that
     /// fails, becomes a paused redelivery with backoff instead of an unhandled exception that would stop the host.
@@ -133,8 +322,7 @@ public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
         }
         catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
         {
-            var attempt = _transientAttempts.GetValueOrDefault(result.TopicPartitionOffset) + 1;
-            _transientAttempts[result.TopicPartitionOffset] = attempt;
+            var attempt = _transientAttempts.AddOrUpdate(result.TopicPartitionOffset, 1, (_, a) => a + 1);
             var backoff = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt - 1), _options.MaxTransientBackoffSeconds));
             LogProcessingFailed(ex, Topic.Value, result.Partition.Value, result.Offset.Value, attempt, backoff);
             MessagingMetrics.Consumed.WithLabels(Topic.Value, "processing_failure").Inc();
@@ -186,7 +374,7 @@ public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
             await handler.HandleAsync(
                 new ConsumedEvent<TPayload>(envelope, result.Topic, result.Partition.Value, result.Offset.Value, headers),
                 stoppingToken).ConfigureAwait(false);
-            _transientAttempts.Remove(result.TopicPartitionOffset);
+            _transientAttempts.TryRemove(result.TopicPartitionOffset, out _);
             MessagingMetrics.HandlerDuration.WithLabels(Topic.Value).Observe(Stopwatch.GetElapsedTime(started).TotalSeconds);
             MessagingMetrics.Consumed.WithLabels(Topic.Value, "handled").Inc();
             return null;
@@ -198,8 +386,7 @@ public sealed partial class KafkaConsumerHost<TPayload> : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
         {
-            var attempt = _transientAttempts.GetValueOrDefault(result.TopicPartitionOffset) + 1;
-            _transientAttempts[result.TopicPartitionOffset] = attempt;
+            var attempt = _transientAttempts.AddOrUpdate(result.TopicPartitionOffset, 1, (_, a) => a + 1);
             var backoff = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt - 1), _options.MaxTransientBackoffSeconds));
             LogTransientFailure(ex, Topic.Value, result.Partition.Value, result.Offset.Value, attempt, backoff);
             MessagingMetrics.Consumed.WithLabels(Topic.Value, "transient_failure").Inc();

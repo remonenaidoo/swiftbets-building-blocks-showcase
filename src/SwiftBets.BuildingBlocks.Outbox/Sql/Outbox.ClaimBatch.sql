@@ -1,7 +1,8 @@
 WITH next AS
 (
     SELECT TOP (@BatchSize) *
-    FROM outbox.Messages WITH (UPDLOCK, READPAST, ROWLOCK)
+    -- Seek the filtered pending index: with a growing sent history the optimizer otherwise scans the whole table (D190).
+    FROM outbox.Messages WITH (INDEX(IX_OutboxMessages_Pending), UPDLOCK, READPAST, ROWLOCK)
     WHERE SentAt IS NULL
       AND NextAttemptAt <= @Now
       AND (LeaseUntil IS NULL OR LeaseUntil < @Now)

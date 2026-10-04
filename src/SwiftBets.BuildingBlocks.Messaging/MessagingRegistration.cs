@@ -23,13 +23,13 @@ public static class MessagingRegistration
         return services;
     }
 
-    public static IServiceCollection AddKafkaConsumer<TPayload, THandler>(this IServiceCollection services, string topicBase, string groupId, bool startAtLatest = false)
+    public static IServiceCollection AddKafkaConsumer<TPayload, THandler>(this IServiceCollection services, string topicBase, string groupId, bool startAtLatest = false, int maxInFlight = 1)
         where TPayload : IEventContract
         where THandler : class, IEventHandler<TPayload>
     {
         services.AddScoped<IEventHandler<TPayload>, THandler>();
         services.AddSingleton<IHostedService>(sp => new KafkaConsumerHost<TPayload>(
-            new ConsumerRegistration(topicBase, groupId, startAtLatest),
+            new ConsumerRegistration(topicBase, groupId, startAtLatest, maxInFlight),
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<IEventPublisher>(),
             sp.GetRequiredService<IOptions<KafkaOptions>>(),

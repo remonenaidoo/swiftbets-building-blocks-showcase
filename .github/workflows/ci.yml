@@ -16,18 +16,53 @@ permissions:
   contents: read
 
 jobs:
-  dotnet:
-    uses: remonenaidoo/swiftbets-platform/.github/workflows/dotnet.yml@main
-    permissions:
-      contents: read
-      packages: write
-      security-events: write
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Fetch shared packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fetch-shared-packages.sh .
+      - run: dotnet restore
+      - run: dotnet build -c Release --no-restore
+      - run: dotnet test -c Release --no-build
+      - name: Vulnerable packages
+        run: |
+          dotnet list package --vulnerable --include-transitive | tee vulnerable.txt
+          ! grep -qE '^\s+> ' vulnerable.txt
 
   release:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
-    needs: dotnet
-    uses: remonenaidoo/swiftbets-platform/.github/workflows/dotnet-release.yml@main
-    with:
-      version: ${{ inputs.version }}
+    needs: build-test
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Fetch shared packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fetch-shared-packages.sh .
+      - env:
+          VERSION: ${{ inputs.version }}
+        run: dotnet pack -c Release -o artifacts -p:Version="${VERSION:-${GITHUB_REF_NAME#v}}"
+      # A dispatched release creates its tag on the built commit; a pushed tag already has one.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v${VERSION:-${GITHUB_REF_NAME#v}}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --generate-notes
+          gh release upload "$tag" artifacts/*.nupkg --repo "$GITHUB_REPOSITORY" --clobber

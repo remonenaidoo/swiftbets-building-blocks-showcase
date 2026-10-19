@@ -12,6 +12,7 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
     <Authors>Remone Naidoo</Authors>
     <Company>Remone Naidoo</Company>
     <Copyright>Copyright (c) 2026 Remone Naidoo</Copyright>

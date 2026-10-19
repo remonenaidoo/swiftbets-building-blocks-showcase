@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads the SwiftBets.* packages pinned in Directory.Packages.props from the public GitHub releases of
-# swiftbets-building-blocks and swiftbets-contracts into .packages/ (the local feed nuget.config points at).
+# swiftbets-building-blocks-showcase and swiftbets-contracts-showcase into .packages/ (the local feed nuget.config points at).
 # No sign-in needed; set GH_TOKEN to lift GitHub's anonymous rate limit.
 set -euo pipefail
 
@@ -19,8 +19,8 @@ auth=()
   sed -E 's/Include="([^"]+)" Version="([^"]+)"/\1 \2/' |
   while read -r package version; do
     case "$package" in
-      SwiftBets.Contracts*) repo="swiftbets-contracts" ;;
-      SwiftBets.BuildingBlocks*) repo="swiftbets-building-blocks" ;;
+      SwiftBets.Contracts*) repo="swiftbets-contracts-showcase" ;;
+      SwiftBets.BuildingBlocks*) repo="swiftbets-building-blocks-showcase" ;;
       *) echo "unknown shared package $package"; exit 1 ;;
     esac
     echo "$repo v$version"
